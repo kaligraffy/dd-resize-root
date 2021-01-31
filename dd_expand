@@ -1,0 +1,127 @@
+#!/bin/bash
+set -eu
+
+# dd_expand - burn encrypted btrfs image (btrfs inside luks) to disk and expand it to full size of disk
+
+IMAGE_FILE=""
+DISK=""
+BS="8M"
+BOOTSIZE="256MiB"
+SCRIPTPATH="$(dirname $(realpath $0))"
+MOUNT="${SCRIPTPATH}/disk-mnt"
+CRYPTVOLUME="crypt-volume"
+
+print_usage(){
+  usage="";
+  usage="./dd_expand 'image file' 'disk'" 
+  echo "$usage";
+}
+
+check_run_as_root(){
+  
+  if (( EUID != 0 )); then
+    echo_error "This script must be run as root/sudo";
+    exit 1;
+  fi
+}
+
+#prompts user for a reply
+#returns 0 for yes or 1 for no
+ask_yes_or_no(){
+  local prompt;
+  local answer;
+  prompt="${1}";
+  echo "$prompt"
+  while read -r -n 1 -s answer; do
+    if [[ $answer = [YyNn] ]]; then
+      [[ $answer = [Yy] ]] && retval=0;
+      [[ $answer = [Nn] ]] && retval=1;
+      break;
+    fi
+  done
+  echo
+  return $retval;
+}
+
+inner_fs_resize(){
+  local fs_type;
+  fs_type=$(blkid "/dev/mapper/${CRYPTVOLUME}" | cut --delimiter='=' --fields=6 | tr -d '"')
+  case $fs_type in
+    "btrfs") 
+      echo "btrfs resize"
+      apt-get install btrfs-progs
+      mkdir -p "${MOUNT}" || true
+      mount -t btrfs "/dev/mapper/${CRYPTVOLUME}" "${MOUNT}" 
+      btrfs filesystem resize max "${MOUNT}"
+      btrfs filesystem show "${MOUNT}"
+      umount "${MOUNT}"
+      rmdir "${MOUNT}";
+      ;;
+    "ext4") 
+      echo "ext4 - not yet implemented"
+    ;;
+    *) echo "skipping, fs not supported"; exit
+    ;;
+  esac
+}
+
+main(){
+  echo "$(basename "$0") started"
+  local prompt;
+  local fs_type;
+  local password;
+  IMAGE_FILE=${1};
+  DISK=${2};
+  
+  check_run_as_root
+  
+  if [[ -z ${IMAGE_FILE} ]]; then
+    echo "IMAGE_FILE is not set"
+    print_usage
+    exit 1
+  fi
+  
+  if [[ -z ${DISK} ]]; then
+    echo "DISK is not set"
+    print_usage
+    exit 1
+  fi
+  
+  lsblk
+  echo
+  prompt="Burn ${IMAGE_FILE} to ${DISK} y/n?"
+  if ! ask_yes_or_no "${prompt}"; then
+    exit 1;
+    echo "$(basename "$0") finished"
+  fi
+  
+  apt-get install parted
+  
+  dd if=${IMAGE_FILE} of=${DISK} bs=${BS} status=progress;
+  sync;
+  
+  fs_type=$(lsblk -no FSTYPE ${DISK}2 | tr -d ' ')
+  parted --script "${DISK}" resizepart 2 100%
+  parted --script "${DISK}" print
+
+  case $fs_type in
+    "crypto_LUKS")
+          read -s -p "Enter crypt volume password" password
+          echo $password | cryptsetup luksOpen ${DISK}2 ${CRYPTVOLUME} 
+          echo $password | cryptsetup resize ${CRYPTVOLUME} -v
+          cryptsetup status ${CRYPTVOLUME}
+          inner_fs_resize
+          cryptsetup luksClose ${CRYPTVOLUME}
+          cryptsetup remove ${CRYPTVOLUME}
+    ;;
+    *) echo "skipping, fs not supported"; exit
+    ;;
+  esac
+  sync
+  
+  echo "$(basename "$0") finished"
+  exit 0;
+}
+
+# Run program
+main "${1:-$IMAGE_FILE}" "${2:-$DISK}";
